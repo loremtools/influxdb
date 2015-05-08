@@ -3,6 +3,9 @@ package influxdb
 import (
 	"errors"
 	"time"
+
+	"github.com/influxdb/influxdb/data"
+	"github.com/influxdb/influxdb/meta"
 )
 
 const defaultReadTimeout = 5 * time.Second
@@ -12,6 +15,52 @@ var ErrTimeout = errors.New("timeout")
 // Coordinator handle queries and writes across multiple local and remote
 // data nodes.
 type Coordinator struct {
+	MetaStore meta.Store
+	DataNode  data.Node
+}
+
+// FIXME: Pointer to ShardInfo is used because there is no unique identifier for
+// a ShardInfo
+type ShardMapping map[*meta.ShardInfo][]Point
+
+func (c *Coordinator) MapShards(wp *WritePointsRequest) (ShardMapping, error) {
+
+	// holds the start time ranges for required shard groups
+	timeRanges := map[time.Time]*meta.ShardGroupInfo{}
+
+	rp, err := c.MetaStore.RetentionPolicy(wp.Database, wp.RetentionPolicy)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, p := range wp.Points {
+		timeRanges[p.Timestamp.Truncate(rp.ShardGroupDuration)] = nil
+	}
+
+	// holds all the shard groups and shards that are required for writes
+	for t := range timeRanges {
+		g, err := c.MetaStore.CreateShardGroupIfNotExists(wp.Database, wp.RetentionPolicy, t)
+		if err != nil {
+			return nil, err
+		}
+		timeRanges[t] = g
+	}
+
+	shardMapping := make(ShardMapping)
+	for _, p := range wp.Points {
+		g, ok := timeRanges[p.Timestamp.Truncate(rp.ShardGroupDuration)]
+
+		sid := p.SeriesID()
+		shardID := sid % uint64(len(g.Shards))
+		shardInfo := g.Shards[shardID]
+		points, ok := shardMapping[&shardInfo]
+		if !ok {
+			shardMapping[&shardInfo] = []Point{p}
+		} else {
+			shardMapping[&shardInfo] = append(points, p)
+		}
+	}
+	return shardMapping, nil
 }
 
 // Write is coordinates multiple writes across local and remote data nodes
@@ -20,6 +69,11 @@ func (c *Coordinator) Write(p *WritePointsRequest) error {
 
 	// FIXME: use the consistency level specified by the WritePointsRequest
 	pol := newConsistencyPolicyN(1)
+
+	_, err := c.MapShards(p)
+	if err != nil {
+		return err
+	}
 
 	// FIXME: build set of local and remote point writers
 	ws := []PointsWriter{}
